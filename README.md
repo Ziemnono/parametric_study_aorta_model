@@ -87,11 +87,9 @@ All CFD-derived surfaces, parameters, and supplementary case descriptions are pe
 
 Download the archive, extract it next to this repository, and point the `data/` directory to the extracted folder if you need the full-resolution meshes.
 
-> Replace the DOI placeholder above with your published Zenodo record before making the repository public.
-
 ## Citation
 
-If you use this pipeline or the accompanying dataset in your research, please cite the Zenodo record and this GitHub repository. A sample BibTeX entry is available from the Zenodo page once the DOI is minted.
+If you use this pipeline or the accompanying dataset in your research, please cite the Zenodo record and this GitHub repository.
 
 ## License
 
