@@ -1,23 +1,72 @@
+import json
 import os
-import numpy as np
-from paraview.simple import XMLPolyDataReader, servermanager
+from pathlib import Path
+from typing import Dict, Iterable, Tuple
+
 import matplotlib.pyplot as plt
+import numpy as np
 from matplotlib.ticker import ScalarFormatter
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+from paraview.simple import XMLPolyDataReader, servermanager
 from vtkmodules.util.numpy_support import vtk_to_numpy
-import json
+
+LOW_WSS_THRESHOLD = 0.070477
+HIGH_WSS_THRESHOLD = 7.867869
+LOG_HIST_BINS = 1000
+LINEAR_BIN_WIDTH = 0.1
+DEFAULT_TIME_STEP_RANGE = (20, 39)
 
 
-def numpy_from_pvd_paraview(case, INPUT_DIRECTORY):
+def _validate_time_step_range(time_step_range: Tuple[int, int]) -> Tuple[int, int]:
+    """Ensure the requested time-step window is sensible."""
+    start, end = time_step_range
+    if start < 0 or end <= start:
+        raise ValueError(
+            f"Invalid time_step_range {time_step_range}. "
+            "Expected non-negative start and end > start."
+        )
+    return start, end
 
-    pvd_file = os.path.join(
-        INPUT_DIRECTORY,
-        case,
-        "surface",
-        "artery_opened_ma",
-        "artery_opened_ma.pvd",
+
+def _compute_frt_percentages(wss_values: np.ndarray) -> Dict[str, float]:
+    """Return fractional residence time percentages for the standard thresholds."""
+    total_count = wss_values.size
+    if total_count == 0:
+        return {"low": 0.0, "intermediate": 0.0, "high": 0.0}
+
+    low_count = np.sum(wss_values < LOW_WSS_THRESHOLD)
+    mid_count = np.sum(
+        (wss_values >= LOW_WSS_THRESHOLD) & (wss_values <= HIGH_WSS_THRESHOLD)
     )
-    if not os.path.exists(pvd_file):
+    high_count = np.sum(wss_values > HIGH_WSS_THRESHOLD)
+    return {
+        "low": low_count / total_count * 100.0,
+        "intermediate": mid_count / total_count * 100.0,
+        "high": high_count / total_count * 100.0,
+    }
+
+
+def _split_wss_by_range(wss_values: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split wall shear stress values into the three canonical ranges."""
+    low = wss_values[wss_values <= LOW_WSS_THRESHOLD]
+    mid = wss_values[
+        (wss_values > LOW_WSS_THRESHOLD) & (wss_values < HIGH_WSS_THRESHOLD)
+    ]
+    high = wss_values[wss_values >= HIGH_WSS_THRESHOLD]
+    return low, mid, high
+
+
+def numpy_from_pvd_paraview(case: str, input_directory: Path) -> np.ndarray:
+    """Load the full wall shear stress time series for a case using ParaView."""
+
+    pvd_file = (
+        input_directory
+        / case
+        / "surface"
+        / "artery_opened_ma"
+        / "artery_opened_ma.pvd"
+    )
+    if not pvd_file.exists():
         raise FileNotFoundError(f"PVD file not found at {pvd_file}")
 
     import xml.etree.ElementTree as ET
@@ -49,20 +98,20 @@ def numpy_from_pvd_paraview(case, INPUT_DIRECTORY):
     datasets.sort(key=_get_time)
 
     wall_shear_series = []
-    base_dir = os.path.dirname(pvd_file)
+    base_dir = pvd_file.parent
     first_shape = None
 
     for ds in datasets:
         file_rel = ds.get("file")
         if not file_rel:
             continue
-        file_path = os.path.join(base_dir, file_rel)
-        if not os.path.exists(file_path):
+        file_path = base_dir / file_rel
+        if not file_path.exists():
             print(f"Warning: {file_path} does not exist. Skipping.")
             continue
 
         # Read VTP file using ParaView
-        reader = XMLPolyDataReader(FileName=[file_path])
+        reader = XMLPolyDataReader(FileName=[str(file_path)])
         reader.UpdatePipeline()
 
         # Get output data object
@@ -93,34 +142,22 @@ def numpy_from_pvd_paraview(case, INPUT_DIRECTORY):
     return wall_shear_array
 
 
-def examination(data_dict, OUTPUT_DIRECTORY, time_step_range):
+def examination(data_dict: Dict[str, Dict], output_directory: Path, time_step_range):
+    """Create the grouped FRT bar plot summarising every case."""
+
     bar_data = []
-    LOW_WSS_THRESHOLD = 0.070477
-    HIGH_WSS_THRESHOLD = 7.867869
-    for case in data_dict:
+    start_time, end_time = _validate_time_step_range(time_step_range)
 
-        bar_data = []
-        start_time, end_time = time_step_range
-    for case in data_dict:
-        wall_shear = data_dict[case]["wall_shear_all"][start_time:end_time]
-        low_wss_count = np.sum(wall_shear < LOW_WSS_THRESHOLD)
-        intermediate_wss_count = np.sum(
-            (wall_shear >= LOW_WSS_THRESHOLD) & (wall_shear <= HIGH_WSS_THRESHOLD)
-        )
-        high_wss_count = np.sum(wall_shear > HIGH_WSS_THRESHOLD)
-        total_count = wall_shear.size
-
+    for case, metadata in data_dict.items():
+        wall_shear = metadata["wall_shear_all"][start_time:end_time]
+        frt = _compute_frt_percentages(wall_shear)
         bar_data.append(
             {
                 "case": case,
-                "diameter": data_dict[case].get("diameter", "unknown"),
-                "stroke_volume": data_dict[case].get("SV", "unknown"),
-                "cfd_max_mesh_size": data_dict[case].get(
-                    "cfd_max_mesh_size", "unknown"
-                ),
-                "low": low_wss_count / total_count * 100,
-                "intermediate": intermediate_wss_count / total_count * 100,
-                "high": high_wss_count / total_count * 100,
+                "diameter": metadata.get("diameter", "unknown"),
+                "stroke_volume": metadata.get("SV", "unknown"),
+                "cfd_max_mesh_size": metadata.get("cfd_max_mesh_size", "unknown"),
+                **frt,
             }
         )
 
@@ -199,17 +236,21 @@ def examination(data_dict, OUTPUT_DIRECTORY, time_step_range):
                 fontsize=12,
             )
 
-    fig_path = os.path.join(OUTPUT_DIRECTORY, "wss_distribution.png")
+    fig_path = output_directory / "wss_distribution.png"
     plt.savefig(fig_path, dpi=300, bbox_inches="tight")
     plt.close()
 
 
-def threshold_calculator_examination(data_dict, time_step_range):
+def threshold_calculator_examination(
+    data_dict: Dict[str, Dict], time_step_range: Tuple[int, int]
+):
+    """Log the 5th and 95th percentile WSS values for every case."""
 
-    for case in data_dict:
+    start_time_step, end_time_step = _validate_time_step_range(time_step_range)
+
+    for case, metadata in data_dict.items():
         print(f"case: {case}")
-        wall_shear = data_dict[case]["wall_shear_all"]
-        start_time_step, end_time_step = time_step_range
+        wall_shear = metadata["wall_shear_all"]
         selected_wall_shear = wall_shear[start_time_step:end_time_step].flatten()
         p5 = np.percentile(selected_wall_shear, 5)
         p95 = np.percentile(selected_wall_shear, 95)
@@ -223,12 +264,11 @@ def wss_histogram_linear_log_plot(
     output_directory,
     time_step_range,
 ):
-    LOW_WSS_THRESHOLD = 0.070477
-    HIGH_WSS_THRESHOLD = 7.867869
+    """Save per-case histograms summarising the linear and log WSS distribution."""
 
     frt_summary = []  # for later grouped bar charts if needed
 
-    start_time_step, end_time_step = time_step_range
+    start_time_step, end_time_step = _validate_time_step_range(time_step_range)
 
     for case, data in data_dict.items():
         # ---- Extract & slice WSS ----
@@ -255,18 +295,7 @@ def wss_histogram_linear_log_plot(
             print(f"[WARN] No valid WSS after filtering for {case}; skipping.")
             continue
 
-        # ---- FRT by counts (your second snippet logic) ----
-        low_count = np.sum(wss_flat < LOW_WSS_THRESHOLD)
-        mid_count = np.sum(
-            (wss_flat >= LOW_WSS_THRESHOLD) & (wss_flat <= HIGH_WSS_THRESHOLD)
-        )
-        high_count = np.sum(wss_flat > HIGH_WSS_THRESHOLD)
-        total_count = wss_flat.size
-
-        # percentages
-        low_pct = (low_count / total_count) * 100.0
-        mid_pct = (mid_count / total_count) * 100.0
-        high_pct = (high_count / total_count) * 100.0
+        frt = _compute_frt_percentages(wss_flat)
 
         # keep for later bar charts
         frt_summary.append(
@@ -274,29 +303,20 @@ def wss_histogram_linear_log_plot(
                 "case": case,
                 "diameter": data_dict[case].get("diameter", "unknown"),
                 "stroke_volume": data_dict[case].get("SV", "unknown"),
-                "low": low_pct,
-                "intermediate": mid_pct,
-                "high": high_pct,
+                **frt,
             }
         )
 
         # ---- Prepare histogram splits (linear) ----
-        low_data = wss_flat[wss_flat <= LOW_WSS_THRESHOLD]
-        mid_data = wss_flat[
-            (wss_flat > LOW_WSS_THRESHOLD) & (wss_flat < HIGH_WSS_THRESHOLD)
-        ]
-        high_data = wss_flat[wss_flat >= HIGH_WSS_THRESHOLD]
+        low_data, mid_data, high_data = _split_wss_by_range(wss_flat)
 
         # To keep x-axes consistent across cases for comparability:
         x_min_linear = 0.0
         x_max_linear = 10.0  # you already set xlim(0,10)
-        bin_width = 0.1
-        custom_bins = np.arange(x_min_linear, x_max_linear + bin_width, bin_width)
+        custom_bins = np.arange(x_min_linear, x_max_linear + LINEAR_BIN_WIDTH, LINEAR_BIN_WIDTH)
 
         # weights to plot percentages directly
-        if total_count == 0:
-            print(f"[WARN] total_count==0 for {case}; skipping.")
-            continue
+        total_count = wss_flat.size
         w_low = (
             np.ones_like(low_data) * (100.0 / total_count)
             if low_data.size
@@ -429,7 +449,7 @@ def wss_histogram_linear_log_plot(
         inset_ax.text(
             0.035,
             0.90,
-            f"Low: {low_pct:.2f}%",
+            f"Low: {frt['low']:.2f}%",
             transform=inset_ax.transAxes,
             fontsize=10,
             ha="left",
@@ -437,7 +457,7 @@ def wss_histogram_linear_log_plot(
         inset_ax.text(
             0.60,
             0.90,
-            f"Intermediate: {mid_pct:.2f}%",
+            f"Intermediate: {frt['intermediate']:.2f}%",
             transform=inset_ax.transAxes,
             fontsize=10,
             ha="center",
@@ -445,7 +465,7 @@ def wss_histogram_linear_log_plot(
         inset_ax.text(
             1.0,
             0.90,
-            f"High: {high_pct:.2f}%",
+            f"High: {frt['high']:.2f}%",
             transform=inset_ax.transAxes,
             fontsize=10,
             ha="right",
@@ -478,24 +498,22 @@ def wss_histogram_linear_log_plot(
 
 def main():
 
-    CUR_DIR = os.path.curdir
-    INPUT_DIRECTORY = os.path.join(CUR_DIR, "data")
-    OUTPUT_DIRECTORY = os.path.join(CUR_DIR, "figures")
+    repo_root = Path(__file__).resolve().parent
+    input_directory = repo_root / "data"
+    output_directory = repo_root / "figures"
 
-    os.makedirs(OUTPUT_DIRECTORY, exist_ok=True)
+    output_directory.mkdir(exist_ok=True)
 
-    cases = [
-        d
-        for d in os.listdir(INPUT_DIRECTORY)
-        if os.path.isdir(os.path.join(INPUT_DIRECTORY, d))
-    ]
+    cases: Iterable[str] = sorted(
+        d.name for d in input_directory.iterdir() if d.is_dir()
+    )
 
     data_dict = {}
     for case in cases:
         try:
-            wall_shear_all = numpy_from_pvd_paraview(case, INPUT_DIRECTORY)
-            json_path = os.path.join(INPUT_DIRECTORY, case, "parameters.json")
-            with open(json_path, "r") as f:
+            wall_shear_all = numpy_from_pvd_paraview(case, input_directory)
+            json_path = input_directory / case / "parameters.json"
+            with open(json_path, "r", encoding="utf-8") as f:
                 parameters = json.load(f)
             data_dict[case] = {
                 "wall_shear_all": wall_shear_all,
@@ -505,13 +523,15 @@ def main():
             }
         except Exception as e:
             print(f"Error processing case {case}: {e}")
-    examination(data_dict, OUTPUT_DIRECTORY, time_step_range=(20, 39))
-    threshold_calculator_examination(data_dict, time_step_range=(20, 39))
+    examination(data_dict, output_directory, time_step_range=DEFAULT_TIME_STEP_RANGE)
+    threshold_calculator_examination(
+        data_dict, time_step_range=DEFAULT_TIME_STEP_RANGE
+    )
     wss_histogram_linear_log_plot(
         data_dict=data_dict,
         filename="WSS_histogram",
-        output_directory=OUTPUT_DIRECTORY,
-        time_step_range=(20, 39),
+        output_directory=output_directory,
+        time_step_range=DEFAULT_TIME_STEP_RANGE,
     )
 
 
